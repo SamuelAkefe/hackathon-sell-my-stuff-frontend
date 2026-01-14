@@ -99,5 +99,86 @@ output "cloudfront_url" {
 }
 
 
+# 1. Get GitHub's OIDC Thumbprint dynamically
+data "tls_certificate" "github" {
+  url = "https://token.actions.githubusercontent.com/.well-known/openid-configuration"
+}
+
+# 2. Create the Identity Provider in AWS
+resource "aws_iam_openid_connect_provider" "github" {
+  url             = "https://token.actions.githubusercontent.com"
+  client_id_list  = ["sts.amazonaws.com"]
+  thumbprint_list = [data.tls_certificate.github.certificates[0].sha1_fingerprint]
+}
+
+# 3. Create the Role for GitHub Actions
+resource "aws_iam_role" "github_actions_role" {
+  name = "github-actions-deploy-role"
+
+  # The Trust Policy: Who can assume this role?
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRoleWithWebIdentity"
+        Effect = "Allow"
+        Principal = {
+          Federated = aws_iam_openid_connect_provider.github.arn
+        }
+        Condition = {
+          StringLike = {
+            # STRICTLY limit this to YOUR repository and branch
+            # format: repo:<org>/<repo>:ref:refs/heads/<branch>
+            "token.actions.githubusercontent.com:sub": "repo:SamuelAkefe/hackathon-sell-my-stuff-frontend:ref:refs/heads/main"
+          }
+          StringEquals = {
+            "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+          }
+        }
+      }
+    ]
+  })
+}
+
+# 4. Attach Permissions to the Role
+# This gives the role permission to Sync S3 and Invalidate CloudFront
+resource "aws_iam_policy" "deploy_policy" {
+  name        = "github-actions-deploy-policy"
+  description = "Allow S3 sync and CloudFront invalidation"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = [
+          "s3:PutObject",
+          "s3:GetObject",
+          "s3:ListBucket",
+          "s3:DeleteObject"
+        ]
+        Resource = [
+          aws_s3_bucket.static_site.arn,      # The bucket itself
+          "${aws_s3_bucket.static_site.arn}/*" # All files inside
+        ]
+      },
+      {
+        Effect   = "Allow"
+        Action   = "cloudfront:CreateInvalidation"
+        Resource = aws_cloudfront_distribution.s3_distribution.arn
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "attach_deploy" {
+  role       = aws_iam_role.github_actions_role.name
+  policy_arn = aws_iam_policy.deploy_policy.arn
+}
+
+# Output the Role ARN so you can copy it later
+output "role_arn" {
+  value = aws_iam_role.github_actions_role.arn
+}
 
             
